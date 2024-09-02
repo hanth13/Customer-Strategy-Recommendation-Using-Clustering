@@ -1,0 +1,1066 @@
+---
+title: "Advance Data Analytics Group Assignment"
+author: "Group 30"
+date: ''
+output:
+  html_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install packages if they haven't been installed
+# install.packages('factoextra')
+# install.packages('cluster')
+# install.packages('dplyr')
+# install.packages('psych')
+# install.packages('psychTools')
+# install.packages('readxl')
+# install.packages('Hmisc')
+# install.packages('ggplot2')
+# install.packages('caret')
+# install.packages('GPArotation')
+
+library(factoextra)
+library(cluster)
+library(dplyr)
+library(psych)
+library(psychTools)
+library(readxl)
+library(Hmisc)
+library(ggplot2)
+library(caret)
+library(GPArotation)
+library(gridExtra)
+library("summarytools")
+```
+
+# 1. Data preparation
+
+## 1.1. Import data & select variables
+
+```{r}
+# Import data
+loan.data <- read_excel('loan_data_ADA_assignment.xlsx')
+```
+
+``` {r}
+# Describe the data and save in "descriptives_loan.data.html"
+df_descr <- dfSummary(loan.data)
+filename <- "descriptives_loan.data.html"
+print(df_descr, file = filename)
+```
+
+```{r}
+headTail(loan.data)
+```
+
+Observations:
+- There is no duplication as all id records are distinct
+- Categorical variables are currently listed as character. 
+- id and member_id contain no information
+- loan_amnt, funded_amnt and funded_amnt_inv appear the same (reconfirmed below)
+- Variables with >20% of missing values are not selected fur cluster analysis (CA): desc, mths_since_last_delinq, mths_since_last_record, next_pymnt_d, mths_since_last_major_derog, tot_coll_amt, tot_cur_bal, total_credit_rv
+- Free text nominal categorical variables not selected for CA: title, desc, emp_title
+- Nominal categorical variables are converted into factors for cluster interpretation: purpose, home_ownership, verification, zip_code, addr_state, loan_is_bad
+- Variables that are dominant in one value (i.e, not sufficiently distinctive) is not selected for CA: pymnt_plan, acc_now_delinq, policy_code, collections_12_mths_ex_med, pub_rec, total_rec_late_fee, delinq_2yrs and recoveries
+- Class imbalance observed in loan_status with Default (10 records / 0.0%), Late (16-30 days) (45 / 0.1%), In Grace Period (139 / 0.3%) and Late (31-120 days) (321 / 0.6%), which may cause minority clusters.
+
+```{r}
+# Check correlation amongst loan_amnt, funded_amnt and funded_amnt_inv 
+c <- c('loan_amnt', 'funded_amnt', 'funded_amnt_inv')
+(cor(loan.data[names(loan.data) %in% c]))
+```
+
+This confirms the three variables are almost perfectly correlated; thus, we only select loan_amount for further analysis.
+
+```{r}
+# Convert nominal categorical variables to factor for interpretation
+columns <- c('home_ownership', 'purpose', 'verification_status', 'zip_code', 'addr_state','sub_grade','loan_status', 'loan_is_bad')
+loan.data[columns] <- lapply(loan.data[columns], as.factor)
+```
+
+```{r}
+# Encode ordinal categorical variables for further analysis
+loan.data$sub_grade_n = as.numeric(factor(loan.data$sub_grade, levels = c('A1', 'A2', 'A3', 'A4', 'A5', 'B1', 'B2', 'B3', 'B4', 'B5', 'C1', 'C2', 'C3', 'C4', 'C5', 'D1', 'D2', 'D3', 'D4', 'D5', 'E1', 'E2', 'E3', 'E4', 'E5', 'F1', 'F2', 'F3', 'F4', 'F5', 'G1', 'G2', 'G3', 'G4', 'G5')))
+
+loan.data$loan_status_n = as.numeric(factor(loan.data$loan_status, levels = c('Fully Paid', 'Current', 'In Grace Period', 'Late (16-30 days)','Late (31-120 days)', 'Default','Charged Off')))
+```
+
+```{r}
+# Convert earliest_cr_line to number of months of credit history to Mar 2024 for further analysis
+loan.data$earliest_cr_line_months_before_mar2024 <- (as.numeric(format(as.Date("2024-03-01"), "%Y")) - as.numeric(format(loan.data$earliest_cr_line, "%Y"))) * 12 + (as.numeric(format(as.Date("2024-03-01"), "%m")) - as.numeric(format(loan.data$earliest_cr_line, "%m")))
+```
+
+We select variables in accordance with the observations and judgement detailed in the report. 
+
+```{r}
+# Select variables used for analysis
+selected_vars <- c('loan_amnt', 'term', 'int_rate', 'installment', 'emp_length', 'annual_inc', 'dti', 'revol_bal', 'revol_util', 'total_pymnt', 'total_rec_prncp','total_rec_int', 'sub_grade_n', 'loan_status_n', 'earliest_cr_line_months_before_mar2024')
+```
+
+## 1.2. Check missing values
+
+Two variables selected for further analysis contain missing value are emp_length (1802 NA records) and revol_util (31 NA records). Thus we explore if there is any pattern on those NA records.
+
+``` {r}
+# Get the subset with emp_length of NA
+emp_length_NA <- loan.data %>% filter(is.na(emp_length))
+
+# Extract only selected variables
+emp_length_NA <- emp_length_NA[names(emp_length_NA) %in% selected_vars]
+
+# Describe the subset and save in "descriptives_emp_length_NA.html"
+df_descr <- dfSummary(emp_length_NA)
+filename <- "descriptives_emp_length_NA.html"
+view(df_descr, file = filename)
+```
+
+We do not observe any pattern in the NA records of emp_length; thus, we exclude them for sampling. The similar approach is taken for revol_util given a nominal number of NA records. 
+
+
+## 1.3. Sample data
+
+```{r}
+# Sample 500 observations from the dataset excluding NA records of emp_length or revol_util
+set.seed(123)
+sample.data <-loan.data %>% filter(!is.na(emp_length) & !is.na(revol_util)) %>% sample_n(500, replace=0)
+```
+
+```{r}
+# Get the subset including only selected variables used for analysis
+sample.data.s <- sample.data[, (names(sample.data) %in% selected_vars)] 
+```
+
+```{r}
+# Describe the selected records and variables
+df_descr <- dfSummary(sample.data.s)
+filename <- "descriptives_sample.data.s.html"
+view(df_descr, file = filename)
+```
+
+
+## 1.4. Check outliers (univariate by z-score)
+
+### 1.4.1. Explore outliers
+
+```{r}
+# Standardize the data (i.e., z-core)
+sample.data.s <- scale(sample.data.s)
+
+# Convert to tibble
+sample.data.s <- as_tibble(sample.data.s)
+```
+
+```{r}
+summary(sample.data.s)
+```
+
+We observe that installment, annual_inc, revol_bal, total_rec_int and earliest_cr_line_months_before_mar2024 includes records with z-score of >4.
+
+```{r}
+# Check outliers for installment
+ggplot(sample.data.s, aes(x=installment)) + geom_boxplot() + ggtitle("Boxplot of Installment z-score")
+```
+We will remove 2 records of installment with z-score of >4.
+
+```{r}
+# Check outliers for annual_inc
+ggplot(sample.data.s, aes(x=annual_inc)) + geom_boxplot() + ggtitle("Boxplot of Annual Income z-score")
+```
+
+We will remove records with annual_inc z-score of >4.
+
+```{r}
+# Check outliers for revol_bal
+ggplot(sample.data.s, aes(x=revol_bal)) + geom_boxplot() + ggtitle("Boxplot of Revolving balance z-score")
+```
+
+We will remove records with revol_bal z-score of >4.
+
+```{r}
+# Check outliers for total_rec_int
+ggplot(sample.data.s, aes(x=total_rec_int)) + geom_boxplot() + ggtitle("Boxplot of Total received interest z-score")
+```
+
+We will remove records with total_rec_int z-score of >4.
+
+```{r}
+# Check outliers for earliest_cr_line_months_before_mar2024
+ggplot(sample.data.s, aes(x=earliest_cr_line_months_before_mar2024)) + geom_boxplot() + ggtitle("Boxplot of earliest_cr_line_months_before_mar2024 z-score")
+```
+
+We will remove record of earliest_cr_line_months_before_mar2024 z-score of > 4
+
+### 1.4.2. Remove outliers
+
+```{r}
+# Get index of the outliers
+index <- which((sample.data.s$installment >4) | (sample.data.s$annual_inc >4) | (sample.data.s$revol_bal >4) | (sample.data.s$total_rec_int >4) | (sample.data.s$earliest_cr_line_months_before_mar2024 > 4))
+
+# Remove them from the original sample
+sample.data <- sample.data[-index,]
+```
+
+```{r}
+# Update sample.data.s
+sample.data.s <- sample.data[, (names(sample.data) %in% selected_vars)] 
+
+# Recalculate the z-score
+sample.data.s <- scale(sample.data.s)
+
+# Convert into tibble 
+sample.data.s <- as_tibble(sample.data.s)
+```
+
+
+## 1.5. Check outliers (multivariate by Mahalanobis)
+
+Calculate Mahalanobis distance to identify potential outliers.
+
+```{r}
+Maha <- mahalanobis(sample.data.s,colMeans(sample.data.s),cov(sample.data.s))
+print(Maha)
+```
+
+Based on the results, some of the distances are much higher than others. To identify any of the distances that are statistically significant, we calculate p-values for each distance, which is the Chi-Square statistic of the Mahalanobis distance with k-1 degrees of freedom, where k is the number of variables.
+
+```{r}
+MahaPvalue <-pchisq(Maha,df=14,lower.tail = FALSE)
+print(MahaPvalue)
+print(sum(MahaPvalue<0.001))
+```
+
+``` {r}
+# Get the outlier set including records that have MahaPvalue <0.001
+index <- which(MahaPvalue<0.001) 
+outliers <- sample.data.s[index,]
+
+# describe the outliers
+describe(outliers)
+```
+
+Outliers do not appear to represent a minotiry cluster thus we remove them for further analysis.
+
+``` {r}
+# Remove those records
+sample.data <- sample.data[-index,]
+```
+
+```{r}
+# Update sample.data.s
+sample.data.s <- sample.data[, (names(sample.data) %in% selected_vars)] 
+
+# Recalculate the z-score
+sample.data.s <- scale(sample.data.s)
+
+# Convert into tibble 
+sample.data.s <- as_tibble(sample.data.s)
+```
+
+
+# 2. Exploratory Factor Analysis (FA)
+
+Objective: 
+- Identify representative variables
+- Create a new set of variables 
+- Use factors in further analysis
+
+## 2.1. Check assuptions for FA
+
+```{r}
+# Check pairwise correlation matrix
+corr.matrix <- cor(sample.data.s)
+```
+
+``` {r}
+round(corr.matrix, 2)
+```
+
+``` {r}
+lowerCor(sample.data.s)
+```
+
+Observations: There is high correlation between pairs of:
+- loan_amnt, total_pymnt, total_rec_prncp, total_rec_int and installment
+- interest rate & sub_grade
+
+Other variables have low correlation.
+
+```{r}
+KMO(sample.data.s)
+```
+
+The Kaiser-Meyer-Olkin (KMO) test is a standard to assess the suitability of a data set for PCA. KMO value is 0.62, exceeding the threshold requirement of 0.5.
+
+```{r}
+cortest.bartlett(sample.data.s)
+```
+
+The Bartlett test is also significant (p-value <0.05), meaning there is sufficient correlation exists amount the variables.  
+
+
+## 2.2. Conduct FA
+
+### 2.2.1. PC extraction with Oblique rotation
+
+We try modelling with different number of factors and the 11-factor solution results in no cross-loadings.
+
+```{r}
+pcModel3o<-principal(sample.data.s, 11, rotate="oblimin")
+print.psych(pcModel3o, cut=0.3, sort=TRUE)
+```
+
+TC1 underlies four variables total_rec_prncp, installment, total_pymnt and loan_amnt whereas TC2 underlies int_rate and sub_grade_n. All other variables are explained by one factor alone.
+
+
+### 2.2.2. PC extraction with Orthogonal rotation
+
+```{r}
+pcModel3q<-principal(sample.data.s, 11, rotate="quartimax")
+print.psych(pcModel3q, cut=0.3, sort=TRUE)
+```
+
+We try modelling  different number of factors however cross-loadings exist with total_rec_int in all scenario.
+
+
+### 2.2.3.  Maximum likehood with Oblique rotation
+
+```{r}
+fa3o<-(fa(sample.data.s,10, n.obs=482, rotate="oblimin", fm="ml"))
+print.psych(fa3o, cut=0.3,sort="TRUE")
+fa.diagram(fa3o)
+```
+
+We try modelling with different number of factors. In any case, there is at least one pair of factors has correlation of >=0.6.
+
+
+### 2.2.4. Maximum likehood method with Orthogonal rotation
+
+```{r}
+fa3v<-(fa(sample.data.s,10, n.obs=459, rotate="varimax", fm="ml"))
+print.psych(fa3v, cut=0.3,sort="TRUE")
+fa.diagram(fa3v)
+```
+
+We try modelling with different number of factors. In any case, cross-loadings occurs for total_rec_int.
+
+
+## 2.3. Model selection
+
+Model (2.2.1) PC extraction with Oblique rotation is considered the most optimal with no cross-loadings. 
+
+Except for variables explained by TC1 and TC2, the remaning variables are explained by one factor alone. Thus we will use TC1 to represent total_rec_prncp, installment, total_pymnt and loan_amnt and TC2 to represent int_rate and sub_grade and keep all other variables as is. 
+
+```{r}
+# Set scores to true to get scores
+pcModel3o<-principal(sample.data.s, 11, rotate="oblimin", scores = TRUE)
+```
+
+We can use the factor scores for further analysis, before doing that we need to add them into our dataframe:
+
+```{r}
+# Score FA scores in a dataframe
+fascores <- as_tibble(pcModel3o$scores)
+
+# Load TC1 and TC2 into the standardized dataset
+sample.data.s.FA <- cbind(sample.data.s, fascores$TC1, fascores$TC2)
+
+# Drop explained variables
+c <- c('total_rec_prncp', 'installment', 'total_pymnt', 'loan_amnt', 'int_rate', 'sub_grade_n')
+sample.data.s.FA <- sample.data.s.FA[, !(names(sample.data.s.FA) %in% c)]
+```
+
+
+# 3. Clustering Analysis (CA)
+
+## 3.1. Check assumptions for CA
+
+### 3.1.1. Multicollinearity
+
+```{r}
+# Check pairwise correlation matrix
+corr.matrix <- cor(sample.data.s.FA)
+```
+
+``` {r}
+round(corr.matrix, 2)
+```
+
+``` {r}
+lowerCor(sample.data.s.FA)
+```
+
+As a result of Factor Analysis, multicollinearity is considered remediated. No pair of variables have a correlation of >0.8.
+
+
+### 3.1.2. Outliers
+
+Completed as per section 1.4 and 1.5
+
+
+## 3.2. Conduct CA
+
+### 3.2.1. Hierarchical
+
+#### a. Find the Linkage Method
+
+Since we don’t know beforehand which linkage method will produce the best clusters, we write a short function to perform hierarchical clustering using several different methods.
+
+Note that this function calculates the agglomerative coefficient of each method, which is metric that measures the strength of the clusters. The closer this value is to 1, the stronger the clusters.
+
+```{r}
+# Define linkage methods
+m <- c( "average", "single", "complete", "ward")
+names(m) <- c( "average", "single", "complete", "ward")
+```
+
+```{r}
+# Function to compute agglomerative coefficient
+ac <- function(x) {
+  agnes(sample.data.s.FA, method = x)$ac
+}
+```
+
+```{r}
+# Calculate agglomerative coefficient for each clustering linkage method
+sapply(m, ac)
+```
+
+We can see that Ward’s minimum variance method produces the highest agglomerative coefficient, thus we’ll use that as the method for our final hierarchical clustering:
+
+
+#### b. Determine the Optimal Number of Clusters.
+
+To determine how many clusters the observations should be grouped in, we use the gap statistic, which compares the total intra-cluster variation for different values of k with their expected values for a distribution with no clustering.
+
+Calculate gap statistic for each number of clusters (up to 7 clusters) 
+
+```{r}
+gap_stat_h <- clusGap(sample.data.s.FA, FUN = hcut, nstart = 25, K.max = 7, B = 50)
+gap_stat_k <- clusGap(sample.data.s.FA, FUN = kmeans, nstart = 25, K.max = 7, B = 50)
+```
+
+Produce plot of clusters vs. gap statistic
+
+```{r}
+fviz_gap_stat(gap_stat_h)
+fviz_gap_stat(gap_stat_k)
+```
+
+From the plot (kmeans method) we can see that the gap statistic is high at k = 4 or 5 clusters. We choose to group our observations into 4 or 5 distinct clusters.
+
+
+#### c. Find distance matrix
+
+##### i. Euclidean distance
+
+```{r}
+distance_mat_1 <- dist(sample.data.s.FA, method = 'euclidean')
+```
+
+Fitting Hierarchical clustering Model to dataset
+
+```{r}
+set.seed(240)  # Setting seed
+Hierar_cl_1 <- hclust(distance_mat_1, method = "ward.D")
+Hierar_cl_1
+```
+
+Plotting dendrogram
+
+```{r}
+plot(Hierar_cl_1)
+```
+
+##### ii. Chebychev
+
+```{r}
+distance_mat_2 <- dist(sample.data.s.FA, method = 'maximum')
+```
+
+Fitting Hierarchical clustering Model to dataset
+
+```{r}
+set.seed(240)  # Setting seed
+Hierar_cl_2 <- hclust(distance_mat_2, method = "ward.D")
+Hierar_cl_2
+```
+
+Plotting dendrogram
+
+```{r}
+plot(Hierar_cl_2,main="Cluster Dendrogram for Ward linkage and Maximum distance")
+```
+
+##### iii. Mahattan distance
+
+```{r}
+distance_mat_3 <- dist(sample.data.s.FA, method = 'manhattan')
+```
+
+Fitting Hierarchical clustering Model to dataset
+
+```{r}
+set.seed(240)  # Setting seed
+Hierar_cl_3 <- hclust(distance_mat_3, method = "ward.D")
+Hierar_cl_3
+```
+
+Plotting dendrogram
+
+```{r}
+plot(Hierar_cl_3)
+```
+
+Clustering with ward linkage and maximum distance seem to be the best among 3 distance types
+
+#### d. Fit into 4 clusters 
+
+Cutting tree by 4 clusters
+
+```{r}
+# Euclidian - Ward
+fit_1 <- cutree(Hierar_cl_1, k = 4)
+table(fit_1)
+
+# Maximum - Ward
+fit_2 <- cutree(Hierar_cl_2, k = 4)
+table(fit_2)
+
+# Mahattan - Ward
+fit_3 <- cutree(Hierar_cl_3, k = 4)
+table(fit_3)
+```
+
+Our of the three models, we select the Chebychew distance with ward linkage as outlined in the report.
+
+```{r}
+# Append cluster labels to original data
+final_data <-cbind(sample.data.s.FA, cluster = fit_2)
+```
+
+
+```{r}
+# Display first six rows of final data
+head(final_data)
+```
+
+
+```{r}
+# Find mean values for each cluster
+hcentres<-aggregate(x=final_data, by=list(cluster=fit_2), FUN="mean")
+
+# Rename TC1 and TC2
+names(hcentres)[names(hcentres) == "fascores$TC1"] <- "TC1"
+names(hcentres)[names(hcentres) == "fascores$TC2"] <- "TC2"
+
+#Format as table
+library(knitr)
+table_hcentres <- knitr::kable(round(hcentres,2), caption = "**Mean values for each cluster**",align="c")
+print(table_hcentres)
+write.csv(hcentres, "hcentres_table.csv", row.names = FALSE)
+```
+
+### 3.2.2. Kmeans clustering
+
+```{r}
+set.seed(55)
+k_cl <- kmeans(sample.data.s.FA,4,nstart=25)
+k_cl 
+write.csv(k_cl$centers, "K-mean.csv", row.names = FALSE)
+
+```
+
+### 3.2.3. Cluster plots
+
+```{r}
+# Kmeans
+km.plot <- eclust(sample.data.s, "kmeans", k = 4 ,nstart = 25, graph = FALSE)
+k.cluster.plot<- fviz_cluster(km.plot, geom = "point", ellipse.type = "norm",
+             palette = "jco", ggtheme = theme_minimal())
+ggsave("k_cluster_plot.png", plot = k.cluster.plot, width = 10, height = 5)
+
+# Hierachical
+h.plot <- eclust(sample.data.s, "hclust", k = 4 ,nstart = 25, graph = FALSE)
+h.cluster.plot <- fviz_cluster(h.plot, geom = "point", ellipse.type = "norm",
+             palette = "jco", ggtheme = theme_minimal())
+ggsave("h_cluster_plot.png", plot = h.cluster.plot, width = 10, height = 5)
+```
+
+Add clusters to data
+
+```{r}
+# Add the cluster from hierachical to the original data
+final.cluster.data.1 <- cbind(sample.data, cluster = as.factor(fit_2))
+
+# Define the labels for each level
+cluster_labels_1 <- c("Low risk high return", "Low risk low return", "High risk low return", "High risk high return")
+
+# Apply the labels to the cluster column and create a new column
+final.cluster.data.1 <- mutate(final.cluster.data.1, cluster_label = factor(final.cluster.data.1$cluster, labels = cluster_labels_1))
+
+# Add the cluster from k-mean to the original data
+final.cluster.data.2 <- cbind(sample.data, cluster = as.factor(k_cl$cluster))
+
+# Add the cluser from k-mean to the FA data
+final_data_2 <-cbind(sample.data.s, cluster = as.factor(k_cl$cluster))
+
+# Define the labels for each level
+cluster_labels_2 <- c("Low risk low return", "High risk low return", "High risk high return", "Low risk high return")
+
+# Apply the labels to the cluster column and create a new column
+final.cluster.data.2 <- mutate(final.cluster.data.2, cluster_label = factor(final.cluster.data.2$cluster, labels = cluster_labels_2))
+```
+
+## 3.3. Cluster profile
+
+### 3.3.1 Cluster by home ownership
+
+#### a. Hierarchical
+
+```{r}
+# Load required packages
+library(ggplot2)
+
+# Calculate the percentage of each cluster by home ownership
+cluster_home_perc.1 <- with(final.cluster.data.1, table(cluster, home_ownership) / rowSums(table(cluster, home_ownership)) * 100)
+
+# Convert the table to a data frame
+cluster_home_perc_df.1 <- as.data.frame(cluster_home_perc.1)
+
+# Plot the stacked 100% bar chart
+plot1.1 <- ggplot(cluster_home_perc_df.1, aes(x = factor(cluster), y = Freq, fill = home_ownership)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Percentage", fill = "Home Ownership")+
+  theme(legend.position = "right")+
+  ggtitle("Percentage of Each Cluster by Home Ownership")
+
+# Create a table of counts
+cluster_home_count1 <- table(final.cluster.data.1$cluster, final.cluster.data.1$home_ownership)
+
+# Convert the table to a data frame
+cluster_home_count_df1 <- as.data.frame(cluster_home_count1)
+
+# Rename the columns
+colnames(cluster_home_count_df1) <- c("Cluster", "Home_Ownership", "Count")
+
+# Plot the stacked column chart
+plot2.1 <-ggplot(cluster_home_count_df1, aes(x = factor(Cluster), y = Count, fill = Home_Ownership)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Number of customers", fill = "Home ownership") +
+  theme(legend.position = "none") +
+  ggtitle("Number of Customers by Home Ownership")
+
+# Combine the plots with one legend
+combined_plots1 <- grid.arrange(plot2.1, plot1.1, ncol = 2)
+combined_plots1
+ggsave("combined_plot(hierarchical).png", combined_plots1, width = 10, height = 5)
+```
+
+#### b. K-means
+
+```{r}
+# Calculate the percentage of each cluster by home ownership
+cluster_home_perc.2 <- with(final.cluster.data.2, table(cluster, home_ownership) / rowSums(table(cluster, home_ownership)) * 100)
+
+# Convert the table to a data frame
+cluster_home_perc_df.2 <- as.data.frame(cluster_home_perc.2)
+
+# Plot the stacked 100% bar chart
+plot1.2 <- ggplot(cluster_home_perc_df.2, aes(x = cluster, y = Freq, fill = home_ownership)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Percentage", fill = "Home Ownership")+
+  theme(legend.position = "right")+
+  ggtitle("Percentage of Each Cluster by Home Ownership")
+
+# Create a table of counts
+cluster_home_count2 <- table(final.cluster.data.2$cluster, final.cluster.data.2$home_ownership)
+
+# Convert the table to a data frame
+cluster_home_count_df2 <- as.data.frame(cluster_home_count2)
+
+# Rename the columns
+colnames(cluster_home_count_df2) <- c("Cluster", "Home_Ownership", "Count")
+
+# Plot the stacked column chart
+plot2.2 <-ggplot(cluster_home_count_df2, aes(x = factor(Cluster), y = Count, fill = Home_Ownership)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Number of customers", fill = "Home ownership") +
+  theme(legend.position = "none") +
+  ggtitle("Number of Customers by Home Ownership")
+
+# Combine the plots with one legend
+combined_plots2 <- grid.arrange(plot2.2, plot1.2, ncol = 2)
+combined_plots2
+ggsave("combined_plot(kmeans).png", combined_plots2, width = 10, height = 5)
+```
+
+
+### 3.3.2. Cluster by income and risk
+
+#### a. Hierarchical
+
+```{r}
+Income_risk_plot.1<- ggplot(final_data,aes(x=fascores$TC2, y=annual_inc,col=as.factor(cluster))) +
+  geom_smooth() +
+  ggtitle("Annual Income by Risk levels") +
+  labs(x = "Risk identification", y = "Annual Income", col = "Cluster")
+Income_risk_plot.1
+ggsave("Income_risk_plot(Hierarchical).png", Income_risk_plot.1, width = 10, height = 5)
+```
+
+#### b. Kmeans
+
+```{r}
+Income_risk_plot.2<- ggplot(final_data_2,aes(x=fascores$TC2, y=annual_inc,col=as.factor(cluster))) +
+  geom_point() +
+  ggtitle("Annual Income by Risk levels") +
+  labs(x = "Risk identification", y = "Annual Income", col = "Cluster")
+Income_risk_plot.2
+ggsave("Income_risk_plot (kmeans).png", Income_risk_plot.2, width = 10, height = 5)
+```
+
+
+### 3.3.3. Cluster by income and employment length
+
+#### a. Hierachical
+
+```{r}
+# Create graph
+Income_emplength_plot.1<- ggplot(final.cluster.data.1,aes(x=emp_length, y=annual_inc,col=cluster)) +
+  geom_point() +
+  ggtitle("Annual Income by Employment Length") +
+  labs(x = "Employment length", y = "Annual Income", col = "Cluster")
+Income_emplength_plot.1
+
+# Save to file
+ggsave("Income_emplength_plot(hierarchical).png", Income_emplength_plot.1, width = 10, height = 5)
+```
+
+Cluster 4 has the highest income and longest employment length 
+
+#### b. Kmeans
+
+```{r}
+# Create graph
+Income_emplength_plot.2<- ggplot(final.cluster.data.2,aes(x=emp_length, y=annual_inc,col=cluster)) +
+  geom_point() +
+  ggtitle("Annual Income by Employment Length") +
+  labs(x = "Employment length", y = "Annual Income", col = "Cluster")
+Income_emplength_plot.2
+
+# Save to file
+ggsave("Income_emplength_plot(kmeans).png", Income_emplength_plot.2, width = 10, height = 5)
+```
+
+
+### 3.3.4. Cluster by debt and interest
+
+#### a. Hierarchical
+
+```{r}
+debt_interest_plot.1 <- ggplot(final_data,aes(x=fascores$TC1, y=total_rec_int,col=as.factor(cluster))) + 
+  geom_point() +
+  ggtitle("Loan-related figures by Total Collected Interests") +
+  labs(x = "Loan-related figures", y = "Total collected interests", col = "Cluster")
+
+debt_interest_plot.1
+# Save to file
+ggsave("Debt_interest_plot(Hierachical).png", debt_interest_plot.1 , width = 10, height = 5)  
+```
+
+Cluster 4 also take out the largest loan and paid most interests >> Most profitable customers
+
+#### b. Kmeans
+
+```{r}
+debt_interest_plot.2 <- ggplot(final_data_2,aes(x=fascores$TC1, y=total_rec_int,col=as.factor(cluster))) + 
+  geom_point() + 
+  ggtitle("Loan-related figures by Total Collected Interests") +
+  labs(x = "Loan-related figures", y = "Total collected interests", col = "Cluster")
+
+debt_interest_plot.2
+# Save to file
+ggsave("Debt_interest_plot(Kmeans).png", debt_interest_plot.2 , width = 10, height = 5)  
+```
+
+
+### 3.3.5 Cluster by loan good_bad
+
+#### a. Hierarchical
+
+```{r}
+# Calculate the percentage of each cluster by home ownership
+cluster_loan_default_perc.1 <- with(final.cluster.data.1, table(cluster, loan_is_bad) / rowSums(table(cluster, loan_is_bad)) * 100)
+
+# Convert the table to a data frame
+cluster_home_loan_default_df.1 <- as.data.frame(cluster_loan_default_perc.1)
+
+# Plot the stacked 100% bar chart
+ggplot(cluster_home_loan_default_df.1, aes(x = factor(cluster), y = Freq, fill = loan_is_bad)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Percentage", fill = "Loan default") +
+  theme(legend.position = "top") +
+  ggtitle("Percentage of Each Cluster by Loan Default")
+
+# Create a table of counts
+cluster_loan_default_count.1 <- table(final.cluster.data.1$cluster, final.cluster.data.1$loan_is_bad)
+
+# Convert the table to a data frame
+cluster_loan_default_df.1 <- as.data.frame(cluster_loan_default_count.1)
+
+# Rename the columns
+colnames(cluster_loan_default_df.1) <- c("Cluster", "Loan_Default", "Count")
+
+# Plot the stacked column chart
+loan_default_plot.1 <- ggplot(cluster_loan_default_df.1, aes(x = factor(Cluster), y = Count, fill = Loan_Default)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Number of customers", fill = "Loan Default") +
+  theme(legend.position = "top") +
+  ggtitle("Number of Customers by Loan Default")
+loan_default_plot.1
+
+# Save to file
+ggsave("Loan_default_plot (hierarchical).png",loan_default_plot.1 , width = 10, height = 5)  
+```
+
+#### b. Kmeans
+
+```{r}
+# Calculate the percentage of each cluster by home ownership
+cluster_loan_default_perc.2 <- with(final.cluster.data.2, table(cluster, loan_is_bad) / rowSums(table(cluster, loan_is_bad)) * 100)
+
+# Convert the table to a data frame
+cluster_home_loan_default_df.2 <- as.data.frame(cluster_loan_default_perc.2)
+
+# Plot the stacked 100% bar chart
+loan_default_stacked.2 <- ggplot(cluster_home_loan_default_df.2, aes(x = factor(cluster), y = Freq, fill = loan_is_bad)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Percentage", fill = "Loan default") +
+  theme(legend.position = "right") +
+  ggtitle("Percentage of Each Cluster by Loan Default")
+
+# Create a table of counts
+cluster_loan_default_count.2 <- table(final.cluster.data.2$cluster, final.cluster.data.2$loan_is_bad)
+
+# Convert the table to a data frame
+cluster_loan_default_df.2 <- as.data.frame(cluster_loan_default_count.2)
+
+# Rename the columns
+colnames(cluster_loan_default_df.2) <- c("Cluster", "Loan_Default", "Count")
+
+# Plot the stacked column chart
+loan_default_plot.2 <- ggplot(cluster_loan_default_df.2, aes(x = factor(Cluster), y = Count, fill = Loan_Default)) +
+  geom_col(position = "stack") +
+  labs(x = "Cluster", y = "Number of customers", fill = "Loan Default") +
+  ggtitle("Number of Default Customers by Clusters") +
+  theme(legend.position = "none")
+loan_default_plot.2
+
+# Combine the plots with one legend
+combined_default_plots_2 <- grid.arrange(loan_default_plot.2, loan_default_stacked.2, ncol = 2)
+combined_default_plots_2
+ggsave("combined_plot_default(kmean).png", combined_default_plots_2, width = 10, height = 5)
+
+
+# Save to file
+ggsave("Loan_default_plot (kmeans).png",loan_default_plot.2 , width = 10, height = 5)  
+```
+
+
+### 3.3.6. Scatterplot for loan and risk
+
+#### a. Hierarchical
+
+```{r}
+loan_risk_plot_1 <- ggplot(final_data, aes(x = fascores$TC2, y = fascores$TC1, col = as.factor(cluster))) + 
+  geom_point() +
+  ggtitle("Loan-related figures by Risk identification") +
+  labs(x = "Risk identification", y = "Loan-related figures", col = "Cluster")
+
+loan_risk_plot_1
+# Save to file
+ggsave("Loan_risk_plot (Hierarchical).png", loan_risk_plot_1, width = 10, height = 5)  
+```
+
+
+#### b. Kmeans
+
+```{r}
+loan_risk_plot_2 <- ggplot(final_data_2, aes(x = fascores$TC2, y = fascores$TC1, col = as.factor(cluster))) + 
+  geom_point() +
+  ggtitle("Loan-related figures by Risk identification") +
+  labs(x = "Risk identification", y = "Loan-related figures", col = "Cluster")
+
+loan_risk_plot_2
+# Save to file
+ggsave("Loan_risk_plot (Kmeans).png", loan_risk_plot_2 , width = 10, height = 5)  
+
+```
+
+
+### 3.3.7. Loan amount vs Interest
+
+#### a. Hierarchical
+
+```{r}
+interest_principal_plot_1 <- ggplot(final.cluster.data.1, aes(x = total_rec_int, y =loan_amnt , col = as.factor(cluster))) + 
+  geom_point() +
+  ggtitle("Loan Principal by Collected Interest") +
+  labs(x = "Collected Interest", y = "Loan Principal", col = "Cluster")
+
+interest_principal_plot_1
+# Save to file
+ggsave("Interest_principal_plot (Kmeans).png", interest_principal_plot_1 , width = 10, height = 5)
+```
+
+#### b. Kmeans
+
+```{r}
+interest_principal_plot_2 <- ggplot(final.cluster.data.2, aes(x = total_rec_int, y =loan_amnt , col = as.factor(cluster))) + 
+  geom_point() +
+  ggtitle("Loan Principal by Collected Interest") +
+  labs(x = "Collected Interest", y = "Loan Principal", col = "Cluster")
+
+interest_principal_plot_2
+# Save to file
+ggsave("Interest_principal_plot (Kmeans).png", interest_principal_plot_2 , width = 10, height = 5)
+```
+
+
+# 4. Validation
+
+## 4.1. Redo all the steps
+
+### 4.1.1. Sample the validation set
+
+```{r}
+set.seed(131)
+# Randomly subseting sample.data for validation
+validation.data <- sample.data%>% sample_n(200,replace=FALSE)
+
+# Get the subset including only variables used for analysis
+validation.data.s <- validation.data[, (names(validation.data) %in% selected_vars)] 
+
+# scale data
+validation.data.s <- as_tibble(scale(validation.data.s))
+```
+
+### 4.1.2. Factor Analysis
+
+``` {r}
+# Get scores from factor analysis
+pcModel3o_validation <- principal(validation.data.s, 11, rotate="oblimin", scores = TRUE)
+print.psych(pcModel3o, cut=0.3, sort=TRUE)
+```
+
+TC1 and TC2 are the equivalent factors and to be used for validation
+
+```{r}
+# Store FA scores in a dataframe
+fascores_validation <- as_tibble(pcModel3o_validation$scores)
+
+# Load TC1 and TC2 into the standardized dataset
+validation.data.s.FA <- cbind(validation.data.s, fascores_validation$TC1, fascores_validation$TC2)
+
+# Drop explained variables
+c <- c('total_rec_prncp', 'installment', 'total_pymnt', 'loan_amnt', 'int_rate', 'sub_grade_n')
+validation.data.s.FA <- validation.data.s.FA[, !(names(validation.data.s.FA) %in% c)]
+```
+
+### 4.1.3. Cluster Analysis
+
+#### a. Hierarchical
+
+``` {r}
+set.seed(240)  # Setting seed
+
+# Using maximum distance
+distance_mat_validation <- dist(validation.data.s.FA, method = 'maximum')
+
+# Using ward linkage
+Hierar_cl_validation <- hclust(distance_mat_validation, method = "ward.D")
+
+# Cut to 4 clusters
+fit_validation <- cutree(Hierar_cl_validation, k = 4)
+
+# Append cluster labels to original data
+final_data_validation <-cbind(validation.data.s.FA, cluster = fit_validation)
+
+# Find mean values for each cluster
+hcentres_validation <-aggregate(x=final_data_validation, by=list(cluster=fit_validation), FUN="mean")
+hcentres_validation
+```
+
+
+#### b. Kmeans
+
+``` {r}
+# K-mean clustering
+set.seed(55)
+k_cl_validation <- kmeans(validation.data.s.FA,4,nstart=25)
+k_cl_validation
+
+# Add data back to the set
+# Add the cluster from hierarchical to the original data
+final.cluster.data.1.val <- cbind(validation.data, cluster = as.factor(fit_validation))
+```
+
+
+```{r}
+# Define the labels for each cluster based on centroids 
+cluster_labels_1_val <- c("High risk low return", "Low risk high return", "High risk high return", "Low risk low return")
+
+# Apply the labels to the cluster column and create a new column
+final.cluster.data.1.val <- mutate(final.cluster.data.1.val, cluster_label = factor(final.cluster.data.1.val$cluster, labels = cluster_labels_1_val))
+
+# Add the cluster from k-mean to the original data
+final.cluster.data.2.val <- cbind(validation.data, cluster = as.factor(k_cl_validation$cluster))
+
+# Add the cluser from k-mean to the FA data
+final_data_2_val <- cbind(validation.data.s, cluster = as.factor(k_cl_validation$cluster))
+
+# Define the labels for each level
+cluster_labels_2_val <- c("Low risk high return", "High risk low return", "High risk high return", "Low risk low return")
+
+# Apply the labels to the cluster column and create a new column
+final.cluster.data.2.val <- mutate(final.cluster.data.2.val, cluster_label = factor(final.cluster.data.2.val$cluster, labels = cluster_labels_2_val))
+```
+
+## 4.2. Mapping with the sample data to see the difference
+
+### 4.2.1. Hierarchical
+
+```{r}
+# Merge cluster.label column into final.cluster.data.1.val
+final.cluster.data.1.val <- merge(final.cluster.data.1.val, final.cluster.data.1[, c("id", "cluster_label")], by = "id", all.x = TRUE)
+
+# Add new column to compare 2 cluster labels
+final.cluster.data.1.val <- mutate(final.cluster.data.1.val,
+                                   checking = ifelse(as.character(cluster_label.x) == as.character(cluster_label.y), 0, 1))
+
+# Difference percentage 
+(sum(final.cluster.data.1.val$checking) / nrow(final.cluster.data.1.val)) * 100
+```
+
+### 4.2.2 Kmeans
+
+```{r}
+# Merge cluster.label column into final.cluster.data.2.val
+final.cluster.data.2.val <- merge(final.cluster.data.2.val, final.cluster.data.2[, c("id", "cluster_label")], by = "id", all.x = TRUE)
+
+# Add new column to compare 2 cluster labels
+final.cluster.data.2.val <- mutate(final.cluster.data.2.val,
+                                   checking = ifelse(as.character(cluster_label.x) == as.character(cluster_label.y), 0, 1))
+
+# Difference percentage 
+(sum(final.cluster.data.2.val$checking) / nrow(final.cluster.data.2.val)) * 100
+
+# Table showing difference between original and validation
+print(final.cluster.data.2.val %>% group_by(cluster_label.y) %>% summarise(sum(checking),n(),sum(checking)/n()))
+```
+
+
